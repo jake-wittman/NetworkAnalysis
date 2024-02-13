@@ -83,32 +83,49 @@ joinDataWithDictionary <- function(consol_dat, data_dict) {
 #'
 #' @examples
 joinDiabetesData <- function(county_sci, wider_consol_dat) {
+
   # Calculate tertiles for binary edge connections
-  tertiles <- quantile(wider_consol_dat$`Diagnosed Diabetes`, c(0, 0.33, 0.66, 1), na.rm = T)
-  wider_consol_dat$tertile <- cut(wider_consol_dat$`Diagnosed Diabetes`,
-      breaks = tertiles)
-  tertile_levels <- unique(wider_consol_dat$tertile)
+  diab_tertiles <- quantile(wider_consol_dat$`Diagnosed Diabetes`, c(0, 0.33, 0.66, 1), na.rm = T)
+  wider_consol_dat$diab_tertile <- cut(wider_consol_dat$`Diagnosed Diabetes`,
+      breaks = diab_tertiles)
+  diab_tertile_levels <- unique(wider_consol_dat$diab_tertile)
+  dsmes_tertiles <- quantile(wider_consol_dat$program_count, c(0, 0.33, 0.66, 1), na.rm = T)
+  # Can't specify tertiles for programs, so for now just use whatever 3 breaks cut does
+  wider_consol_dat$dsmes_tertile <- cut(wider_consol_dat$program_count, breaks = 3)
+  dsmes_tertile_levels <- unique(wider_consol_dat$dsmes_tertile)
+  # Join diabetes tertiles
   temp <- full_join(county_sci, wider_consol_dat, by = c('user_loc' = 'fipscode'))
-  temp <- select(temp, user_loc, fr_loc, scaled_sci, diab_county_1 = tertile)
+  temp <- select(temp, user_loc, fr_loc, scaled_sci, diab_county_1 = diab_tertile,
+                 dsmes_county_1 = dsmes_tertile)
   temp <- full_join(temp, wider_consol_dat, by = c('fr_loc' = 'fipscode'))
-  temp <- select(temp, user_loc, fr_loc, scaled_sci, diab_county_1, diab_county_2 = tertile)
+  temp <- select(temp, user_loc, fr_loc, scaled_sci, diab_county_1,
+                 dsmes_county_1,
+                 diab_county_2 = diab_tertile,
+                 dsmes_county_2 = dsmes_tertile)
   temp$diab_relationship <-
     ifelse(
-      temp$diab_county_1 == levels(tertile_levels)[length(levels(tertile_levels))] &
-        temp$diab_county_2 == levels(tertile_levels)[length(levels(tertile_levels))],
+      temp$diab_county_1 == levels(diab_tertile_levels)[length(levels(diab_tertile_levels))] &
+        temp$diab_county_2 == levels(diab_tertile_levels)[length(levels(diab_tertile_levels))],
+      1,
+      0
+    )
+  temp$dsmes_relationship <-
+    ifelse(
+      temp$dsmes_county_1 == levels(dsmes_tertile_levels)[length(levels(dsmes_tertile_levels))] &
+        temp$dsmes_county_2 == levels(dsmes_tertile_levels)[length(levels(dsmes_tertile_levels))],
       1,
       0
     )
 
   # Add diabetes prevalence to do a sum for continusous edges
   temp <- full_join(temp, wider_consol_dat, by = c('user_loc' = 'fipscode'))
-  temp <- select(temp, user_loc, fr_loc, scaled_sci, diab_relationship,
+  temp <- select(temp, user_loc, fr_loc, scaled_sci, diab_relationship, dsmes_relationship,
                  diab_prev_county_1 = `Diagnosed Diabetes`)
   temp <- full_join(temp, wider_consol_dat, by = c('fr_loc' = 'fipscode'))
-  temp <- select(temp, user_loc, fr_loc, scaled_sci, diab_relationship,
+  temp <- select(temp, user_loc, fr_loc, scaled_sci, diab_relationship, dsmes_relationship,
                  diab_prev_county_1, diab_prev_county_2 = `Diagnosed Diabetes`)
   temp <- mutate(temp, prev_sum = diab_prev_county_1 + diab_prev_county_2)
-  select(temp, user_loc, fr_loc, scaled_sci, diab_relationship, prev_sum)
+  select(temp, user_loc, fr_loc, scaled_sci, diab_relationship, dsmes_relationship, prev_sum)
 }
 
 #' Setup network
@@ -125,31 +142,26 @@ joinDiabetesData <- function(county_sci, wider_consol_dat) {
 setupNetwork <-
   function(adj.matrix.diab,
            adj.matrix.sci,
+           adj.matrix.distances,
            vertex.data) {
     vertex.data <-
       vertex.data |> mutate(
-        Obesity = case_when(is.na(Obesity) ~ mean(Obesity, na.rm = T),
-                            TRUE ~ Obesity),
-        `Physical Inactivity` = case_when(
-          is.na(`Physical Inactivity`) ~ mean(`Physical Inactivity`, na.rm = T),
-          TRUE ~ `Physical Inactivity`
-        )
+        across(where(is.numeric), ~case_when(is.na(.x) ~ mean(.x, na.rm = TRUE),
+                                             TRUE ~ .x))
       )
     net <- as.network(adj.matrix.diab)
-    net <- set.vertex.attribute(net, 'obesity', vertex.data$Obesity)
-    net <-
-      set.vertex.attribute(net,
-                           'physical_inactivity',
-                           vertex.data$`Physical Inactivity`)
+    #net <- set.vertex.attribute(net, 'obesity', vertex.data$Obesity)
+    net <- set.vertex.attribute(net, 'log_pop', vertex.data$population)
     # Since SCI is an edge value, need to add it as a network attribute
     net <- set.network.attribute(net, 'log_scaled_sci', adj.matrix.sci)
+    net <- set.network.attribute(net, 'distance_km', adj.matrix.distances)
   }
 
 
 #' Make an adjacency matrix for a given variable as the values in the matrix
 #'
 #' @param edge_dat
-#' @param value
+#' @param value The variable name to become matrix values
 #'
 #' @return
 #' @export
@@ -168,4 +180,36 @@ makeAdjMatrix <- function(edge_dat, value) {
   mat_out <- apply(mat_out, 2, as.numeric) # convert character to #
   colnames(mat_out) <- rownames(mat_out) <- loc_names
   return(mat_out)
+}
+
+#' Get pairwise county distances
+#'
+#' @param county.sf
+#'
+#' @return
+#' @export
+#'
+#' @examples
+getCountyDistances <- function(county.sf) {
+  distances <- st_distance(county.sf$geometry) |>
+    units::set_units(km)
+  rownames(distances) <- county.sf$GEOID
+  colnames(distances) <- county.sf$GEOID
+  distances
+}
+
+#' Convert distance matrix to an edge list where distances are weights
+#'
+#' @param distance.matrix
+#'
+#' @return
+#' @export
+#'
+#' @examples
+distanceMatrixtoEdgeList <- function(distance.matrix) {
+  g <- graph.adjacency(distance.matrix, mode="upper", weighted=TRUE, diag=FALSE)
+  e <- get.edgelist(g)
+  df <- as.data.frame(cbind(e,E(g)$weight))
+  colnames(df) <- c('user_loc', 'fr_loc', 'distance_km')
+  df
 }
